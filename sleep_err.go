@@ -32,6 +32,7 @@ import (
 	"github.com/goki/gi/gi"
 	"github.com/goki/gi/gimain"
 	"github.com/goki/gi/giv"
+	"github.com/goki/ki/ints"
 	"github.com/goki/ki/ki"
 	"github.com/goki/ki/kit"
 )
@@ -234,6 +235,215 @@ var ParamSets = params.Sets{
 				}},
 		},
 	}},
+}
+
+// PoolOneToOne2 functions expands the original PoolOneToOne and enables connections between non-continuous pools.
+//Probably not the best way to do this but works.
+type PoolOneToOne2 struct {
+	NPools     int `desc:"number of recv pools to connect (0 for entire number of pools in recv layer)"`
+	NPools2    int `desc:"number of recv pools to connect (0 for entire number of pools in recv layer)"`
+	SendStart  int `desc:"starting pool index for sending connections"`
+	SendStart2 int `desc:"starting pool index for sending connections"`
+	RecvStart  int `desc:"starting pool index for recv connections"`
+}
+
+func NewPoolOneToOne2() *PoolOneToOne2 {
+	return &PoolOneToOne2{}
+}
+
+func (ot *PoolOneToOne2) Name() string {
+	return "PoolOneToOne"
+}
+
+func (ot *PoolOneToOne2) Connect(send, recv *etensor.Shape, same bool) (sendn, recvn *etensor.Int32, cons *etensor.Bits) {
+	switch {
+	case send.NumDims() == 4 && recv.NumDims() == 4:
+		return ot.ConnectPools(send, recv, same)
+	case send.NumDims() == 2 && recv.NumDims() == 4:
+		return ot.ConnectRecvPool(send, recv, same)
+	case send.NumDims() == 4 && recv.NumDims() == 2:
+		return ot.ConnectSendPool(send, recv, same)
+	case send.NumDims() == 2 && recv.NumDims() == 2:
+		return ot.ConnectOneToOne(send, recv, same)
+	}
+	return
+}
+
+// ConnectPools is when both recv and send have pools
+func (ot *PoolOneToOne2) ConnectPools(send, recv *etensor.Shape, same bool) (sendn, recvn *etensor.Int32, cons *etensor.Bits) {
+	sendn, recvn, cons = prjn.NewTensors(send, recv)
+	sNtot := send.Len()
+	// rNtot := recv.Len()
+	sNp := send.Dim(0) * send.Dim(1)
+	rNp := recv.Dim(0) * recv.Dim(1)
+	sNu := send.Dim(2) * send.Dim(3)
+	rNu := recv.Dim(2) * recv.Dim(3)
+	rnv := recvn.Values
+	snv := sendn.Values
+	npl := rNp
+	if ot.NPools > 0 {
+		npl = ints.MinInt(ot.NPools, rNp)
+	}
+	for i := 0; i < npl; i++ {
+		rpi := ot.RecvStart + i
+		spi := ot.SendStart + i
+		if rpi >= rNp || spi >= sNp {
+			break
+		}
+		for rui := 0; rui < rNu; rui++ {
+			ri := rpi*rNu + rui
+			for sui := 0; sui < sNu; sui++ {
+				si := spi*sNu + sui
+				off := ri*sNtot + si
+				cons.Values.Set(off, true)
+				rnv[ri] = int32(sNu)
+				snv[si] = int32(rNu)
+			}
+		}
+	}
+	return
+}
+
+// ConnectRecvPool is when recv has pools but send doesn't
+func (ot *PoolOneToOne2) ConnectRecvPool(send, recv *etensor.Shape, same bool) (sendn, recvn *etensor.Int32, cons *etensor.Bits) {
+	sendn, recvn, cons = prjn.NewTensors(send, recv)
+	sNtot := send.Len()
+	rNp := recv.Dim(0) * recv.Dim(1)
+	rNu := recv.Dim(2) * recv.Dim(3)
+	rnv := recvn.Values
+	snv := sendn.Values
+	npl := rNp
+	if ot.NPools > 0 {
+		npl = ints.MinInt(ot.NPools, rNp)
+	}
+
+	if sNtot == rNp { // one-to-one
+		for i := 0; i < npl; i++ {
+			rpi := ot.RecvStart + i
+			si := ot.SendStart + i
+			if rpi >= rNp || si >= sNtot {
+				break
+			}
+			for rui := 0; rui < rNu; rui++ {
+				ri := rpi*rNu + rui
+				off := ri*sNtot + si
+				cons.Values.Set(off, true)
+				rnv[ri] = int32(1)
+				snv[si] = int32(rNu)
+			}
+		}
+	} else { // full
+		for i := 0; i < npl; i++ {
+			rpi := ot.RecvStart + i
+			if rpi >= rNp {
+				break
+			}
+			for rui := 0; rui < rNu; rui++ {
+				ri := rpi*rNu + rui
+				for si := 0; si < sNtot; si++ {
+					off := ri*sNtot + si
+					cons.Values.Set(off, true)
+					rnv[ri] = int32(sNtot)
+					snv[si] = int32(npl * rNu)
+				}
+			}
+		}
+	}
+	return
+}
+
+// ConnectSendPool is when send has pools but recv doesn't
+func (ot *PoolOneToOne2) ConnectSendPool(send, recv *etensor.Shape, same bool) (sendn, recvn *etensor.Int32, cons *etensor.Bits) {
+	sendn, recvn, cons = prjn.NewTensors(send, recv)
+	sNtot := send.Len()
+	rNtot := recv.Len()
+	sNp := send.Dim(0) * send.Dim(1)
+	sNu := send.Dim(2) * send.Dim(3)
+	rnv := recvn.Values
+	snv := sendn.Values
+	npl := sNp
+	npl2 := npl
+	npltotal := ot.NPools + ot.NPools2
+	if ot.NPools > 0 {
+		npl = ints.MinInt(ot.NPools, sNp)
+		npl2 = ints.MinInt(ot.NPools2, sNp)
+	}
+
+	if rNtot == sNp { // one-to-one
+		for i := 0; i < npl; i++ {
+			spi := ot.SendStart + i
+			ri := ot.RecvStart + i
+			if ri >= rNtot || spi >= sNp {
+				break
+			}
+			for sui := 0; sui < sNu; sui++ {
+				si := spi*sNu + sui
+				off := ri*sNtot + si
+				cons.Values.Set(off, true)
+				rnv[ri] = int32(sNu)
+				snv[si] = int32(1)
+			}
+		}
+	} else { // full
+		for i := 0; i < npl; i++ {
+			spi := ot.SendStart + i
+			if spi >= sNp {
+				break
+			}
+			for ri := 0; ri < rNtot; ri++ {
+				for sui := 0; sui < sNu; sui++ {
+					si := spi*sNu + sui
+					off := ri*sNtot + si
+					cons.Values.Set(off, true)
+					rnv[ri] = int32(npltotal * sNu)
+					snv[si] = int32(rNtot)
+				}
+			}
+
+		}
+		for j := 0; j < npl2; j++ {
+			spi := ot.SendStart2 + j
+			if spi >= sNp {
+				break
+			}
+			for ri := 0; ri < rNtot; ri++ {
+				for sui := 0; sui < sNu; sui++ {
+					si := spi*sNu + sui
+					off := ri*sNtot + si
+					cons.Values.Set(off, true)
+					rnv[ri] = int32(npltotal * sNu)
+					snv[si] = int32(rNtot)
+				}
+			}
+		}
+	}
+
+	return
+}
+
+// copy of OneToOne.Connect
+func (ot *PoolOneToOne2) ConnectOneToOne(send, recv *etensor.Shape, same bool) (sendn, recvn *etensor.Int32, cons *etensor.Bits) {
+	sendn, recvn, cons = prjn.NewTensors(send, recv)
+	sNtot := send.Len()
+	rNtot := recv.Len()
+	rnv := recvn.Values
+	snv := sendn.Values
+	npl := rNtot
+	if ot.NPools > 0 {
+		npl = ints.MinInt(ot.NPools, rNtot)
+	}
+	for i := 0; i < npl; i++ {
+		ri := ot.RecvStart + i
+		si := ot.SendStart + i
+		if ri >= rNtot || si >= sNtot {
+			break
+		}
+		off := ri*sNtot + si
+		cons.Values.Set(off, true)
+		rnv[ri] = 1
+		snv[si] = 1
+	}
+	return
 }
 
 // Sim encapsulates the entire simulation model, and we define all the
@@ -459,29 +669,29 @@ func (ss *Sim) ConfigNet(net *leabra.Network) {
 	net.ConnectLayers(out, ecin, onetoone, emer.Forward)
 	//	net.ConnectLayers(in, out, prjn.NewOneToOne(), emer.Forward)
 	//Input to Cortex
-	IntoECin := prjn.NewPoolOneToOne()
-	IntoECin.SendStart = 0
-	IntoECin.SendStart2 = 4
-	IntoECin.NPools = 1
-	IntoECin.NPools2 = 2
+	IntoCortex := NewPoolOneToOne2()
+	IntoCortex.SendStart = 0
+	IntoCortex.SendStart2 = 4
+	IntoCortex.NPools = 1
+	IntoCortex.NPools2 = 2
 
-	IntoLetter := prjn.NewPoolOneToOne()
+	IntoLetter := NewPoolOneToOne2()
 	IntoLetter.SendStart = 1
 	IntoLetter.SendStart2 = 1
 	IntoLetter.NPools = 1
 	IntoLetter.NPools2 = 0
 
-	IntoSem := prjn.NewPoolOneToOne()
+	IntoSem := NewPoolOneToOne2()
 	IntoSem.SendStart = 2
 	IntoSem.SendStart2 = 2
 	IntoSem.NPools = 2
 	IntoSem.NPools2 = 0
 
-	net.ConnectLayers(in, cortex, IntoECin, emer.Forward)
+	net.ConnectLayers(in, cortex, IntoCortex, emer.Forward)
 	net.ConnectLayers(in, letterhid, IntoLetter, emer.Forward)
 	net.ConnectLayers(in, sem, IntoSem, emer.Forward)
 
-	CortextoECin := prjn.NewPoolOneToOne()
+	CortextoECin := NewPoolOneToOne2()
 	CortextoECin.SendStart = 2
 	CortextoECin.SendStart2 = 2
 	CortextoECin.RecvStart = 2
@@ -2225,94 +2435,99 @@ func (ss *Sim) MemStats(train bool) {
 	trgOffNB := 0.0
 	trgOnNC := 0.0
 	trgOffNC := 0.0
-
+	actMi, _ := out.UnitVarIdx("ActM")
+	targi, _ := ecin.UnitVarIdx("Targ")
+	actQ1i, _ := ecin.UnitVarIdx("ActQ1")
 	for ni := 0; ni < nn; ni++ {
-		actm := out.UnitVal1D("ActM", ni)
-		trg := ecin.UnitVal1D("Targ", ni) // full pattern target
-		inact := ecin.UnitVal1D("ActQ1", ni)
-		if trg < 0.5 { // trgOff
-			trgOffN += 1
-			if actm > 0.5 {
-				trgOffWasOn += 1
-			}
-		} else { // trgOn
-			trgOnN += 1
-			if inact < 0.5 { // missing in ECin -- completion target
-				cmpN += 1
-				if actm < 0.5 {
-					trgOnWasOffAll += 1
-					trgOnWasOffCmp += 1
+
+		for ni := 0; ni < nn; ni++ {
+			actm := out.UnitVal1D(actMi, ni)
+			trg := ecin.UnitVal1D(targi, ni) // full pattern target
+			inact := ecin.UnitVal1D(actQ1i, ni)
+			if trg < 0.5 { // trgOff
+				trgOffN += 1
+				if actm > 0.5 {
+					trgOffWasOn += 1
 				}
-			} else {
-				if actm < 0.5 {
-					trgOnWasOffAll += 1
+			} else { // trgOn
+				trgOnN += 1
+				if inact < 0.5 { // missing in ECin -- completion target
+					cmpN += 1
+					if actm < 0.5 {
+						trgOnWasOffAll += 1
+						trgOnWasOffCmp += 1
+					}
+				} else {
+					if actm < 0.5 {
+						trgOnWasOffAll += 1
+					}
 				}
 			}
 		}
-	}
-	//this is not a good way to do this but should work
-	for ni := 2*49 - 1; ni < 3*49; ni++ {
-		actm := out.UnitVal1D("ActM", ni)
-		trg := ecin.UnitVal1D("Targ", ni) // full pattern target
-		if trg < 0.5 {                    // trgOff
-			trgOffNB += 1
-			if actm > 0.5 {
-				trgOffWasOnB += 1
-			}
-		} else { // trgOn
-			trgOnNB += 1
-			if actm < 0.5 {
-				trgOnWasOffB += 1
-			}
-		}
-	}
-
-	for ni := 3*49 - 1; ni < 4*49; ni++ {
-		actm := out.UnitVal1D("ActM", ni)
-		trg := ecin.UnitVal1D("Targ", ni) // full pattern target
-		if trg < 0.5 {                    // trgOff
-			trgOffNC += 1
-			if actm > 0.5 {
-				trgOffWasOnC += 1
-			}
-		} else { // trgOn
-			trgOnNC += 1
-			if actm < 0.5 {
-				trgOnWasOffC += 1
+		//this is not a good way to do this but should work
+		for ni := 2*49 - 1; ni < 3*49; ni++ {
+			actm := out.UnitVal1D(actMi, ni)
+			trg := ecin.UnitVal1D(targi, ni) // full pattern target
+			if trg < 0.5 {                   // trgOff
+				trgOffNB += 1
+				if actm > 0.5 {
+					trgOffWasOnB += 1
+				}
+			} else { // trgOn
+				trgOnNB += 1
+				if actm < 0.5 {
+					trgOnWasOffB += 1
+				}
 			}
 		}
-	}
 
-	trgOnWasOffAll /= trgOnN
-	trgOffWasOn /= trgOffN
-	trgOnWasOffB /= trgOnNB
-	trgOffWasOnB /= trgOffNB
-	trgOnWasOffC /= trgOnNC
-	trgOffWasOnC /= trgOffNC
-
-	if train { // no cmp
-		if trgOnWasOffAll < ss.MemThr && trgOffWasOn < ss.MemThr {
-			ss.Mem = 1
-		} else {
-			ss.Mem = 0
+		for ni := 3*49 - 1; ni < 4*49; ni++ {
+			actm := out.UnitVal1D(actMi, ni)
+			trg := ecin.UnitVal1D(targi, ni) // full pattern target
+			if trg < 0.5 {                   // trgOff
+				trgOffNC += 1
+				if actm > 0.5 {
+					trgOffWasOnC += 1
+				}
+			} else { // trgOn
+				trgOnNC += 1
+				if actm < 0.5 {
+					trgOnWasOffC += 1
+				}
+			}
 		}
-	} else { // test
-		if cmpN > 0 { // should be
-			trgOnWasOffCmp /= cmpN
-			if trgOnWasOffCmp < ss.MemThr && trgOffWasOn < ss.MemThr {
+
+		trgOnWasOffAll /= trgOnN
+		trgOffWasOn /= trgOffN
+		trgOnWasOffB /= trgOnNB
+		trgOffWasOnB /= trgOffNB
+		trgOnWasOffC /= trgOnNC
+		trgOffWasOnC /= trgOffNC
+
+		if train { // no cmp
+			if trgOnWasOffAll < ss.MemThr && trgOffWasOn < ss.MemThr {
 				ss.Mem = 1
 			} else {
 				ss.Mem = 0
 			}
+		} else { // test
+			if cmpN > 0 { // should be
+				trgOnWasOffCmp /= cmpN
+				if trgOnWasOffCmp < ss.MemThr && trgOffWasOn < ss.MemThr {
+					ss.Mem = 1
+				} else {
+					ss.Mem = 0
+				}
+			}
 		}
+		ss.TrgOnWasOffAll = trgOnWasOffAll
+		ss.TrgOnWasOffCmp = trgOnWasOffCmp
+		ss.TrgOffWasOn = trgOffWasOn
+		ss.TrgOffWasOnB = trgOffWasOnB
+		ss.TrgOnWasOffB = trgOnWasOffB
+		ss.TrgOffWasOnC = trgOffWasOnC
+		ss.TrgOnWasOffC = trgOnWasOffC
 	}
-	ss.TrgOnWasOffAll = trgOnWasOffAll
-	ss.TrgOnWasOffCmp = trgOnWasOffCmp
-	ss.TrgOffWasOn = trgOffWasOn
-	ss.TrgOffWasOnB = trgOffWasOnB
-	ss.TrgOnWasOffB = trgOnWasOffB
-	ss.TrgOffWasOnC = trgOffWasOnC
-	ss.TrgOnWasOffC = trgOnWasOffC
 }
 
 // TrialStats computes the trial-level statistics and adds them to the epoch accumulators if
@@ -2320,11 +2535,13 @@ func (ss *Sim) MemStats(train bool) {
 // core algorithm side remains as simple as possible, and doesn't need to worry about
 // different time-scales over which stats could be accumulated etc.
 // You can also aggregate directly from log data, as is done for testing stats
+
 func (ss *Sim) TrialStats(accum bool) (sse, avgsse, ssec, avgssec, cosdiff float64) {
 	outLay := ss.Net.LayerByName("Output").(leabra.LeabraLayer).AsLeabra()
 	ss.TrlCosDiff = float64(outLay.CosDiff.Cos)
-	ss.TrlSSEB, ss.TrlAvgSSEB = outLay.MSEB(0.5) // 0.5 = per-unit tolerance -- right side of .5
-	ss.TrlSSEC, ss.TrlAvgSSEC = outLay.MSEC(0.5) // 0.5 = per-unit tolerance -- right side of .5
+	ss.TrlSSEB, ss.TrlAvgSSEB = outLay.MSE(0.5) // 0.5 = per-unit tolerance -- right side of .5
+	ss.TrlSSEC, ss.TrlAvgSSEC = outLay.MSE(0.5) // 0.5 = per-unit tolerance -- right side of .5
+	//SSEB SSEC are wrong...not really used. will fixed later. ignore these stats for now
 	if accum {
 		ss.SumSSE += ss.TrlSSEB
 		ss.SumAvgSSE += ss.TrlAvgSSEB
@@ -2447,11 +2664,9 @@ func (ss *Sim) Stopped() {
 	ss.IsRunning = false
 	if ss.Win != nil {
 		vp := ss.Win.WinViewport2D()
-		vp.BlockUpdates()
 		if ss.ToolBar != nil {
 			ss.ToolBar.UpdateActions()
 		}
-		vp.UnblockUpdates()
 		vp.SetNeedsFullRender()
 	}
 }
@@ -3519,7 +3734,7 @@ func (ss *Sim) WeightsFileName() string {
 
 // LogFileName returns default log file name
 func (ss *Sim) LogFileName(lognm string) string {
-	return ss.Net.Nm + "_" + ss.RunName() + "_" + lognm + ".csv"
+	return ss.Net.Nm + "_" + ss.RunName() + "_" + lognm + ".tsv"
 }
 
 //////////////////////////////////////////////
